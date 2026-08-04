@@ -41,6 +41,7 @@ from probe.multigpu import add_model_parallel_args, load_qwen3vl  # noqa: E402
 
 IMAGE_TAG = re.compile(r"<image>")
 H5_TIME = re.compile(r"_(?P<fps>\d+(?:\.\d+)?)fps\.hdf5:::(?P<index>\d+)$")
+EGOEXO_JPG_INDEX = re.compile(r"/(?P<index>\d+)\.jpg$")
 
 
 def h5_frame_info(item):
@@ -71,6 +72,38 @@ def images_follow_live_whisperx_grid(items, start_image_index):
             return False
         if fps != 2.0 or index != 2 * (start_image_index + offset):
             return False
+    return True
+
+
+def egoexolearn_time_seconds(item):
+    """Return the MMDuet2 EgoExoLearn timestamp from ``%06d.jpg``.
+
+    The official MMDuet2 preprocessing extracts each clip at 1 FPS using
+    ffmpeg's ``%06d.jpg`` numbering.  Therefore 000001.jpg is the clip's
+    first (0-second) visual observation, and image n represents n - 1 seconds.
+    """
+    match = EGOEXO_JPG_INDEX.search(item["path"])
+    if match is None:
+        raise ValueError(f"Missing EgoExoLearn JPG index in {item!r}")
+    index = int(match.group("index"))
+    if index <= 0:
+        raise ValueError(f"Invalid EgoExoLearn JPG index in {item!r}")
+    return float(index - 1)
+
+
+def images_follow_egoexolearn_grid(items):
+    """Check the monotonic 1-FPS JPG sequence released by MMDuet2."""
+    if not items:
+        return False
+    previous = None
+    for item in items:
+        try:
+            current = egoexolearn_time_seconds(item)
+        except (KeyError, TypeError, ValueError):
+            return False
+        if previous is not None and current <= previous:
+            return False
+        previous = current
     return True
 
 
@@ -140,18 +173,31 @@ def turn_events(record):
             if len(used) != count:
                 invalidate(active_episode, "message_image_count_mismatch")
                 continue
-            grid_valid = images_follow_live_whisperx_grid(used, image_start)
-            try:
-                end_time = h5_time_seconds(used[-1])
-            except (KeyError, TypeError, ValueError):
-                invalidate(active_episode, "unparseable_hdf5_timestamp")
+            if all(H5_TIME.search(item["path"]) is not None for item in used):
+                grid_valid = images_follow_live_whisperx_grid(used, image_start)
+                try:
+                    end_time = h5_time_seconds(used[-1])
+                except (KeyError, TypeError, ValueError):
+                    invalidate(active_episode, "unparseable_hdf5_timestamp")
+                    continue
+                grid_error = "hdf5_image_time_mismatch"
+            elif all(EGOEXO_JPG_INDEX.search(item["path"]) is not None for item in used):
+                grid_valid = images_follow_egoexolearn_grid(used)
+                try:
+                    end_time = egoexolearn_time_seconds(used[-1])
+                except (KeyError, TypeError, ValueError):
+                    invalidate(active_episode, "unparseable_egoexolearn_timestamp")
+                    continue
+                grid_error = "egoexolearn_image_time_mismatch"
+            else:
+                invalidate(active_episode, "mixed_or_unparseable_image_timestamp")
                 continue
             if grid_valid:
                 last_visual_time = end_time
             if active_episode is None:
                 continue
             if not grid_valid:
-                invalidate(active_episode, "hdf5_image_time_mismatch")
+                invalidate(active_episode, grid_error)
             pending = {
                 "time": end_time,
                 "episode": active_episode,
@@ -200,8 +246,53 @@ def turn_events(record):
     return events, paired_episodes, dict(skipped)
 
 
-def raw_video_path(video_root, video_id):
-    return Path(video_root) / "videos" / f"{video_id}.mp4"
+EGOEXO_SEGMENT = re.compile(
+    r"^(?P<uid>.+)-(?P<start>\d+(?:\.\d+)?)s_(?P<end>\d+(?:\.\d+)?)s$"
+)
+
+
+def _first_existing(candidates):
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+def resolve_video_source(record, args):
+    """Resolve one SFT record to (MP4 path, source start time, dataset name).
+
+    Live-WhisperX records use their video ID directly. EgoExoLearn records use
+    ``<source_uid>-<start>s_<end>s`` while the downloaded MP4 is named only
+    ``<source_uid>.mp4``.  Their annotation timestamps remain clip-relative;
+    the returned offset is applied only when decoding source video frames.
+    """
+    metadata = record["metadata"]
+    video_id = metadata["video_id"]
+    declared_source = metadata.get("dataset") or metadata.get("data_source")
+    ego_match = EGOEXO_SEGMENT.match(video_id)
+    is_ego = declared_source == "egoexolearn" or (
+        declared_source is None and args.egoexolearn_video_root is not None and ego_match is not None
+    )
+    if is_ego:
+        if args.egoexolearn_video_root is None:
+            raise ValueError(
+                "EgoExoLearn record encountered but --egoexolearn_video_root was not supplied"
+            )
+        if ego_match is None:
+            raise ValueError(f"Invalid EgoExoLearn clip video_id: {video_id}")
+        uid = ego_match.group("uid")
+        start = float(ego_match.group("start"))
+        root = Path(args.egoexolearn_video_root)
+        path = _first_existing((root / f"{uid}.mp4", root / "videos" / f"{uid}.mp4"))
+        return path, start, "egoexolearn"
+
+    if args.video_root is None:
+        raise ValueError(
+            "Encountered a Live-WhisperX record but --video_root was not supplied."
+        )
+    root = Path(args.video_root)
+    path = _first_existing((root / "videos" / f"{video_id}.mp4", root / f"{video_id}.mp4"))
+    return path, 0.0, "live_whisperx"
 
 
 def build_decision_embeddings(model, processor, memories, question, query_graph, visual_context_frames=None):
@@ -227,9 +318,9 @@ def build_decision_embeddings(model, processor, memories, question, query_graph,
 def process_record(record, args, model, processor, collector, neuron_indices, stats,
                    features, labels, metadata, decision_cache=None):
     video_id = record["metadata"]["video_id"]
-    video_path = raw_video_path(args.video_root, video_id)
+    video_path, source_start_time, dataset_name = resolve_video_source(record, args)
     if not video_path.exists():
-        print(f"[skip missing] {video_path}")
+        print(f"[skip missing] dataset={dataset_name} path={video_path}")
         return 0
     events, paired_episodes, skipped_episodes = turn_events(record)
     if args.mode == "stats":
@@ -272,9 +363,10 @@ def process_record(record, args, model, processor, collector, neuron_indices, st
 
     for frame_idx in range(start_frame, end_frame + 1, args.frame_interval):
         timestamp = frame_idx / args.fps
-        frame = extract_frame(str(video_path), timestamp)
+        decode_timestamp = source_start_time + timestamp
+        frame = extract_frame(str(video_path), decode_timestamp)
         if frame is None:
-            frame = extract_frame(str(video_path), max(timestamp - 1, 0))
+            frame = extract_frame(str(video_path), max(source_start_time, decode_timestamp - 1))
         if frame is None:
             continue
         memories.reserve_next_frame()
@@ -328,6 +420,7 @@ def process_record(record, args, model, processor, collector, neuron_indices, st
             del inputs, mask
             label = event["label"]
             event_metadata = {"video_id": video_id, "time": event["time"],
+                              "dataset": dataset_name, "source_start_time": source_start_time,
                               "question": active_question, "label": label,
                               "episode_id": event["episode_id"],
                               "question_id": record["metadata"].get("question_id"),
@@ -373,7 +466,10 @@ def process_record(record, args, model, processor, collector, neuron_indices, st
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--annotations", required=True, help="MMDuet2 Live SFT JSONL or its downloaded subset")
-    parser.add_argument("--video_root", required=True, help="Directory containing videos/<video_id>.mp4")
+    parser.add_argument("--video_root", default=None,
+                        help="Optional Live-WhisperX root; required only when annotations contain Live records.")
+    parser.add_argument("--egoexolearn_video_root", default=None,
+                        help="Optional EgoExoLearn root containing <source_uid>.mp4 files.")
     parser.add_argument("--ckpt_path", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--mode", required=True, choices=["stats", "features"])

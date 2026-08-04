@@ -66,6 +66,12 @@ hf download Qwen/Qwen3-8B \
 ../proactive_interaction_data/data/Live-WhisperX-selected/
   videos/<metadata.video_id>.mp4
 
+../proactive_interaction_data/data/MMDuet2-data/sft/
+  egoexolearn-half_multi_half_single_question-2_sec_per_frame-sft.jsonl
+
+../proactive_interaction_data/data/EgoExoLearn-selected/
+  <source_uid>.mp4
+
 ../proactive_interaction_data/data/OVO-Bench/data/
   ovo_bench_new.json
   src_videos/
@@ -85,16 +91,19 @@ hf download Qwen/Qwen3-8B \
 
 ## 4. 构建可用训练样本
 
-```bash
+```bash  
 python probe/extract_video_subset_jsonl.py \
   --annotations ../proactive_interaction_data/data/MMDuet2-data/sft/live_whisperx-half_multi_half_single_question-2_sec_per_frame-max_180s-sft-h5_images.jsonl \
   --video_root ../proactive_interaction_data/data/Live-WhisperX-selected \
+  --ego_annotations ../proactive_interaction_data/data/MMDuet2-data/sft/egoexolearn-half_multi_half_single_question-2_sec_per_frame-sft.jsonl \
+  --egoexolearn_video_root ../proactive_interaction_data/data/EgoExoLearn-selected \
   --output ../proactive_interaction_data/runs/probe/main/live_sft_available.jsonl \
-  --num_videos 756 \
+  --num_live_videos 756 \
+  --num_egoexolearn_videos 313 \
   --manifest_output ../proactive_interaction_data/runs/probe/main/live_sft_available_videos.txt
 ```
 
-若要选择不同规模，只修改 `--num_videos`，756是总训练样本数；其余后续路径保持不变。
+若要选择不同规模，只修改 `--num_live_videos` 和 `--num_egoexolearn_videos`，Live-WhisperX总样本数是756，EgoExoLearn总样本数是313；其余后续路径保持不变。
 
 
 ## 5. 构造问题级神经元统计与 FP16 决策缓存
@@ -107,13 +116,13 @@ python probe/extract_video_subset_jsonl.py \
 5. 保存 FP16 激活缓存，后续特征阶段无需再次跑 Qwen/场景图。
 
 ```bash
-
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun \
   --standalone \
   --nproc_per_node=8 \
   probe/build_probe_dataset_dp.py \
   --annotations ../proactive_interaction_data/runs/probe/main/live_sft_available.jsonl \
   --video_root ../proactive_interaction_data/data/Live-WhisperX-selected \
+  --egoexolearn_video_root ../proactive_interaction_data/data/EgoExoLearn-selected \
   --ckpt_path ../Qwen/Qwen3-VL-8B-Instruct \
   --output ../proactive_interaction_data/runs/probe/main/activation_stats_dp.pt \
   --mode stats \
@@ -340,7 +349,7 @@ done
 conda activate pvqa-judge-cu124
 
 CUDA_VISIBLE_DEVICES=0 vllm serve \
-  ../proactive_interaction_data/models/Qwen3-8B \
+  ../Qwen/Qwen3-8B \
   --served-model-name Qwen/Qwen3-8B \
   --host 127.0.0.1 \
   --port 8000 \

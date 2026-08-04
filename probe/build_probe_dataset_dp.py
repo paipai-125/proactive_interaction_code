@@ -161,7 +161,10 @@ def count_local_records(annotation_path, selected_video_ids, max_records, rank, 
 def build_parser():
     parser = argparse.ArgumentParser(description="Data-parallel probe stats/features; one full Qwen3-VL per GPU")
     parser.add_argument("--annotations", required=True)
-    parser.add_argument("--video_root", required=True)
+    parser.add_argument("--video_root", default=None,
+                        help="Optional Live-WhisperX root; required only if annotations include Live records.")
+    parser.add_argument("--egoexolearn_video_root", default=None,
+                        help="Optional EgoExoLearn root containing source UID MP4 files.")
     parser.add_argument("--ckpt_path", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--mode", required=True, choices=("stats", "features"))
@@ -185,7 +188,7 @@ def build_parser():
 def main():
     args = build_parser().parse_args()
     if args.fps != 1 or args.frame_interval != 1:
-        raise ValueError("MMDuet2 Live-WhisperX is fixed to fps=1 and frame_interval=1.")
+        raise ValueError("The supported MMDuet2 SFT streams are fixed to fps=1 and frame_interval=1.")
     if args.visual_context_frames is not None and args.visual_context_frames < 1:
         raise ValueError("--visual_context_frames must be positive.")
     if args.mode == "features" and not args.neuron_map:
