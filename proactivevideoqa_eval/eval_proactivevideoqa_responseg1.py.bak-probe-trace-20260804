@@ -167,11 +167,6 @@ def run_one(example, gold, args, model, processor, probe, collector):
     sg_interval = 2 if n_images <= 50 else (n_images - 1) // 50 + 2
     seen_images, stream_time, context = 0, 0.0, []
     result_turns = [{"role": "user", "content": question, "time": 0.0}]
-    # The MMDuet2 evaluator consumes only ``model_response_list``.  Keep a
-    # separate trace for the frozen probe so rejected decisions are visible
-    # too; otherwise an all-negative run is indistinguishable from a broken
-    # inference/output path.
-    probe_decision_trace = []
     for image_refs, texts in turns:
         for image_ref in image_refs:
             stream_time += args.frame_interval  # MMDuet2 ProactiveInferenceClient convention.
@@ -201,28 +196,14 @@ def run_one(example, gold, args, model, processor, probe, collector):
                 del activations
         finally:
             del inputs, mask
-        decision = None
-        if probability is not None:
-            decision = {
-                "time": stream_time,
-                "probe_reply_probability": round(probability, 8),
-                "probe_threshold": args.probe_threshold,
-                "reply": bool(reply),
-            }
-            probe_decision_trace.append(decision)
         if reply:
             content = generate_answer(model, processor, memories, answer_prompt(question, graphs, context))
             if content:
                 turn = {"role": "assistant", "content": content, "time": stream_time}
                 if probability is not None: turn["probe_reply_probability"] = round(probability, 8)
                 result_turns.append(turn)
-                if decision is not None:
-                    decision["generated_answer"] = content
         torch.cuda.empty_cache()
-    output = {"question_id": qid, "model_response_list": result_turns}
-    if probe is not None:
-        output["probe_decision_trace"] = probe_decision_trace
-    return output
+    return {"question_id": qid, "model_response_list": result_turns}
 
 
 def parser():
